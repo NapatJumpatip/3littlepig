@@ -432,7 +432,7 @@ with st.sidebar:
             st.session_state.api_key = key_input
             st.rerun()
     else:
-        st.success("API Key active", icon="✓")
+        st.success("API Key active", icon=":material/check_circle:")
 
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
