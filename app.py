@@ -1,6 +1,11 @@
 """
 Self-Debate Chat — A Claude-inspired Streamlit chat app
-powered by Gemini 1.5 Pro with a 3-agent thinking pipeline.
+powered by Gemini with a 3-agent thinking pipeline.
+
+Key architecture: API key flows through a SINGLE function `get_api_key()`
+that checks secrets → session_state in a deterministic order. The key is
+passed as an explicit string argument to every Gemini call — never read
+from a global or closure mid-pipeline.
 """
 
 import streamlit as st
@@ -10,7 +15,7 @@ import uuid
 from datetime import datetime
 
 # ─────────────────────────────────────────────
-# Page Config
+# Page Config (must be first Streamlit call)
 # ─────────────────────────────────────────────
 st.set_page_config(
     page_title="Self-Debate Chat",
@@ -24,27 +29,21 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Import Fonts ── */
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ── Root Variables ── */
 :root {
     --bg-primary: #FAF9F7;
     --bg-secondary: #F0EEEB;
-    --bg-user-msg: #EDE9E3;
-    --bg-ai-msg: transparent;
     --text-primary: #2D2B28;
     --text-secondary: #6B6560;
     --text-muted: #9C9690;
     --accent: #C4703E;
     --accent-light: #E8C9AD;
     --border: #E5E2DD;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
     --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
     --radius: 16px;
 }
 
-/* ── Global Overrides ── */
 .stApp {
     background-color: var(--bg-primary) !important;
     font-family: 'DM Sans', sans-serif !important;
@@ -56,7 +55,6 @@ header[data-testid="stHeader"] {
     border-bottom: 1px solid var(--border) !important;
 }
 
-/* ── Sidebar ── */
 section[data-testid="stSidebar"] {
     background-color: var(--bg-secondary) !important;
     border-right: 1px solid var(--border) !important;
@@ -71,7 +69,6 @@ section[data-testid="stSidebar"] label {
     font-family: 'DM Sans', sans-serif !important;
 }
 
-/* ── Chat Messages ── */
 .stChatMessage {
     background-color: transparent !important;
     border: none !important;
@@ -89,7 +86,6 @@ section[data-testid="stSidebar"] label {
     background-color: var(--text-primary) !important;
 }
 
-/* ── Chat Input ── */
 .stChatInput {
     max-width: 760px !important;
     margin: 0 auto !important;
@@ -113,7 +109,6 @@ section[data-testid="stSidebar"] label {
     color: var(--text-primary) !important;
 }
 
-/* ── Status / Expander (Thinking Process) ── */
 .stExpander {
     background-color: var(--bg-secondary) !important;
     border: 1px solid var(--border) !important;
@@ -127,7 +122,6 @@ section[data-testid="stSidebar"] label {
     font-size: 0.85rem !important;
 }
 
-/* ── Code Blocks ── */
 .stMarkdown code {
     font-family: 'JetBrains Mono', monospace !important;
     font-size: 0.85rem !important;
@@ -139,7 +133,6 @@ section[data-testid="stSidebar"] label {
     border: 1px solid var(--border) !important;
 }
 
-/* ── Buttons ── */
 .stButton > button {
     font-family: 'DM Sans', sans-serif !important;
     border-radius: 10px !important;
@@ -157,33 +150,6 @@ section[data-testid="stSidebar"] label {
     color: var(--accent) !important;
 }
 
-/* ── Sidebar Chat History Items ── */
-.chat-history-item {
-    padding: 10px 14px;
-    margin: 4px 0;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: background 0.15s ease;
-    font-size: 0.88rem;
-    color: var(--text-primary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    border: 1px solid transparent;
-}
-
-.chat-history-item:hover {
-    background: rgba(196, 112, 62, 0.08);
-    border-color: var(--accent-light);
-}
-
-.chat-history-item.active {
-    background: rgba(196, 112, 62, 0.12);
-    border-color: var(--accent);
-    font-weight: 500;
-}
-
-/* ── Thinking Step Labels ── */
 .thinking-label {
     display: inline-flex;
     align-items: center;
@@ -200,7 +166,6 @@ section[data-testid="stSidebar"] label {
 .label-critic { background: #FEF3E2; color: #B45309; }
 .label-synthesizer { background: #E6F7ED; color: #0E7A3A; }
 
-/* ── Welcome Screen ── */
 .welcome-container {
     text-align: center;
     padding: 6rem 2rem 2rem;
@@ -235,86 +200,108 @@ section[data-testid="stSidebar"] label {
     margin-bottom: 1.5rem;
 }
 
-/* ── Divider ── */
 .subtle-divider {
     border: none;
     border-top: 1px solid var(--border);
     margin: 1rem 0;
 }
 
-/* hide default streamlit footer */
 footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────
-# Session State Initialization
-# ─────────────────────────────────────────────
-def init_session():
-    if "all_chats" not in st.session_state:
-        st.session_state.all_chats = {}  # {chat_id: {title, messages, created_at}}
-    if "active_chat_id" not in st.session_state:
-        st.session_state.active_chat_id = None
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = None
-    if "model_name" not in st.session_state:
-        st.session_state.model_name = "gemini-1.5-flash"
-
-init_session()
+# ═════════════════════════════════════════════
+# SESSION STATE — single init block
+# ═════════════════════════════════════════════
+_DEFAULTS = {
+    "all_chats": {},
+    "active_chat_id": None,
+    "api_key_input": "",       # raw text from sidebar input widget
+    "model_name": "gemini-1.5-flash",
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
-def get_active_messages():
+# ═════════════════════════════════════════════
+# API KEY — single source of truth
+# ═════════════════════════════════════════════
+def get_api_key() -> str | None:
+    """
+    Return a validated, non-empty API key string or None.
+    Priority: st.secrets > sidebar input (stored in session_state).
+    """
+    # 1. Try secrets (Streamlit Cloud / .streamlit/secrets.toml)
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    except FileNotFoundError:
+        pass
+
+    # 2. Try session state (from sidebar text_input)
+    key = st.session_state.get("api_key_input", "")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+
+    return None
+
+
+def validate_api_key(key: str) -> bool:
+    """Quick sanity check — non-empty string of reasonable length."""
+    if not key or not isinstance(key, str):
+        return False
+    return len(key.strip()) >= 20
+
+
+# ═════════════════════════════════════════════
+# CHAT HELPERS
+# ═════════════════════════════════════════════
+def get_active_messages() -> list[dict]:
     cid = st.session_state.active_chat_id
     if cid and cid in st.session_state.all_chats:
         return st.session_state.all_chats[cid]["messages"]
     return []
 
 
-def create_new_chat():
+def create_new_chat() -> str:
     cid = str(uuid.uuid4())[:8]
     st.session_state.all_chats[cid] = {
         "title": "New Chat",
         "messages": [],
-        "created_at": datetime.now().strftime("%H:%M"),
+        "created_at": datetime.now().isoformat(),
     }
     st.session_state.active_chat_id = cid
     return cid
 
 
-def set_chat_title(cid, user_msg):
-    """Set the chat title from the first user message."""
+def set_chat_title(cid: str, user_msg: str):
     title = user_msg[:50].strip()
     if len(user_msg) > 50:
         title += "…"
     st.session_state.all_chats[cid]["title"] = title
 
 
-# ─────────────────────────────────────────────
-# API Key Resolution
-# ─────────────────────────────────────────────
-def resolve_api_key():
-    # 1. st.secrets
-    try:
-        key = st.secrets["GEMINI_API_KEY"]
-        if key:
-            return key
-    except (KeyError, FileNotFoundError):
-        pass
-    # 2. session state (from sidebar input)
-    if st.session_state.api_key:
-        return st.session_state.api_key
-    return None
-
-
-# ─────────────────────────────────────────────
-# Gemini Helpers
-# ─────────────────────────────────────────────
-def call_gemini(api_key: str, system_prompt: str, messages: list[dict], temperature: float = 0.7) -> str:
-    """Call Gemini with retry on 429 and robust error handling."""
+# ═════════════════════════════════════════════
+# GEMINI CALL — key is an explicit argument
+# ═════════════════════════════════════════════
+def call_gemini(
+    api_key: str,
+    model_name: str,
+    system_prompt: str,
+    messages: list[dict],
+    temperature: float = 0.7,
+) -> str:
+    """
+    Single Gemini call with:
+      - genai.configure() right before every request
+      - explicit api_key & model_name args (no globals)
+      - retry on 429, graceful handling of 400/404/safety
+    """
+    # ── Configure immediately before use ──
     genai.configure(api_key=api_key)
-
-    model_name = st.session_state.get("model_name", "gemini-1.5-flash")
 
     model = genai.GenerativeModel(
         model_name=model_name,
@@ -328,63 +315,107 @@ def call_gemini(api_key: str, system_prompt: str, messages: list[dict], temperat
         ],
     )
 
-    # Build Gemini-style conversation history
+    # Build Gemini conversation history
     gemini_history = []
     for m in messages:
         role = "user" if m["role"] == "user" else "model"
         gemini_history.append({"role": role, "parts": [m["content"]]})
 
+    if not gemini_history:
+        return "⚠️ No messages to send."
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # Re-configure on every retry to ensure key is fresh
+            genai.configure(api_key=api_key)
+
             chat = model.start_chat(history=gemini_history[:-1])
             response = chat.send_message(gemini_history[-1]["parts"][0])
             return response.text
+
         except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "resource" in err or "quota" in err:
+            err_str = str(e)
+            err_lower = err_str.lower()
+
+            # ── Rate limit (429) — retry with backoff ──
+            if "429" in err_str or "resource" in err_lower or "quota" in err_lower:
                 wait = 2 ** (attempt + 1)
                 time.sleep(wait)
                 if attempt == max_retries - 1:
-                    return f"⚠️ Rate limit exceeded. Please wait a moment and try again.\n\n`{e}`"
-            elif "safety" in err or "block" in err:
-                return "⚠️ The response was blocked by Gemini's safety filters. Please try rephrasing your message."
-            elif "404" in err or "not found" in err:
+                    return (
+                        "⚠️ **Rate Limit** — Gemini API is overloaded.\n\n"
+                        f"Retried {max_retries} times. Please wait ~30s and try again.\n\n"
+                        f"```\n{err_str}\n```"
+                    )
+                continue  # retry
+
+            # ── Invalid API key (400) ──
+            if "api_key_invalid" in err_lower or (
+                "400" in err_str and "api key" in err_lower
+            ):
                 return (
-                    f"⚠️ Model `{model_name}` not found. "
-                    "Please select a different model in the sidebar.\n\n"
-                    f"`{e}`"
+                    "⚠️ **Invalid API Key** — Google rejected the key.\n\n"
+                    "Please check:\n"
+                    "1. The key is a valid Gemini API key from "
+                    "[aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+                    "2. No extra spaces or newlines were copied\n"
+                    "3. The key has not been revoked or expired\n\n"
+                    f"```\n{err_str}\n```"
                 )
-            else:
-                return f"⚠️ An error occurred: `{e}`"
-    return "⚠️ Unexpected error."
+
+            # ── Model not found (404) ──
+            if "404" in err_str or "not found" in err_lower:
+                return (
+                    f"⚠️ **Model Not Found** — `{model_name}` is unavailable.\n\n"
+                    "Try switching to a different model in the sidebar.\n\n"
+                    f"```\n{err_str}\n```"
+                )
+
+            # ── Safety filter block ──
+            if "safety" in err_lower or "block" in err_lower:
+                return (
+                    "⚠️ **Safety Filter** — Gemini blocked this response.\n\n"
+                    "Please try rephrasing your message."
+                )
+
+            # ── Unknown error — don't retry ──
+            return f"⚠️ **Error**: `{err_str}`"
+
+    return "⚠️ Unexpected error after all retries."
 
 
-def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -> tuple[str, dict]:
+# ═════════════════════════════════════════════
+# SELF-DEBATE PIPELINE
+# ═════════════════════════════════════════════
+def run_self_debate(
+    api_key: str,
+    model_name: str,
+    chat_messages: list[dict],
+    status_container,
+) -> tuple[str, dict]:
     """
-    Execute the 3-agent pipeline:
-      1. Generator → Draft
-      2. Critic → Analysis
-      3. Synthesizer → Final Answer
-    Returns (final_answer, thinking_steps).
+    3-agent pipeline: Generator → Critic → Synthesizer.
+    api_key and model_name are explicit args — never read from globals mid-run.
     """
     thinking = {}
-    _error_prefix = "⚠️ **Agent Error**"
 
     # ── Step 1: Generator ──
-    status_container.update(label="🔵 Generating initial draft…", state="running")
-    generator_system = (
-        "คุณคือ Generator Agent คุณมีหน้าที่ร่างคำตอบเบื้องต้นจากข้อความของผู้ใช้ "
-        "โดยอ้างอิงบริบทจากประวัติการสนทนาทั้งหมด ตอบเป็นภาษาไทย ให้ละเอียดและครอบคลุม "
-        "ใช้ Markdown ได้เต็มรูปแบบ (ตาราง, โค้ด, หัวข้อ)"
+    status_container.update(label="🔵 Step 1/3 — Generating initial draft…", state="running")
+    draft = call_gemini(
+        api_key=api_key,
+        model_name=model_name,
+        system_prompt=(
+            "คุณคือ Generator Agent คุณมีหน้าที่ร่างคำตอบเบื้องต้นจากข้อความของผู้ใช้ "
+            "โดยอ้างอิงบริบทจากประวัติการสนทนาทั้งหมด ตอบเป็นภาษาไทย ให้ละเอียดและครอบคลุม "
+            "ใช้ Markdown ได้เต็มรูปแบบ (ตาราง, โค้ด, หัวข้อ)"
+        ),
+        messages=chat_messages,
+        temperature=0.7,
     )
-    try:
-        draft = call_gemini(api_key, generator_system, chat_messages, temperature=0.7)
-    except Exception as e:
-        draft = f"{_error_prefix} — Generator failed: `{e}`"
     thinking["generator"] = draft
 
-    # If Generator failed critically, skip remaining steps
+    # If Generator failed → abort early
     if draft.startswith("⚠️"):
         thinking["critic"] = "⏭️ Skipped — Generator did not produce a valid draft."
         thinking["synthesizer"] = draft
@@ -392,72 +423,106 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
         return draft, thinking
 
     # ── Step 2: Critic ──
-    status_container.update(label="🟠 Analyzing draft for improvements…", state="running")
-    critic_system = (
-        "คุณคือ Critic Agent คุณจะได้รับร่างคำตอบจาก Generator "
-        "ให้วิเคราะห์จุดอ่อน ข้อผิดพลาด ข้อมูลที่ขาดหาย หรือส่วนที่อาจทำให้เข้าใจผิด "
-        "และเสนอแนะการปรับปรุงอย่างชัดเจน ตอบเป็นภาษาไทย"
-    )
+    status_container.update(label="🟠 Step 2/3 — Analyzing for improvements…", state="running")
     critic_messages = chat_messages + [
         {"role": "assistant", "content": draft},
         {"role": "user", "content": "วิเคราะห์คำตอบข้างต้น: จุดอ่อน ข้อผิดพลาด และข้อเสนอแนะ"},
     ]
-    try:
-        critique = call_gemini(api_key, critic_system, critic_messages, temperature=0.4)
-    except Exception as e:
-        critique = f"{_error_prefix} — Critic failed: `{e}`"
+    critique = call_gemini(
+        api_key=api_key,
+        model_name=model_name,
+        system_prompt=(
+            "คุณคือ Critic Agent คุณจะได้รับร่างคำตอบจาก Generator "
+            "ให้วิเคราะห์จุดอ่อน ข้อผิดพลาด ข้อมูลที่ขาดหาย หรือส่วนที่อาจทำให้เข้าใจผิด "
+            "และเสนอแนะการปรับปรุงอย่างชัดเจน ตอบเป็นภาษาไทย"
+        ),
+        messages=critic_messages,
+        temperature=0.4,
+    )
     thinking["critic"] = critique
 
-    # If Critic failed, Synthesizer works with draft alone
+    # If Critic failed → Synthesizer uses draft alone
+    critique_for_synth = critique
     if critique.startswith("⚠️"):
-        critique_for_synth = "ไม่มีข้อเสนอแนะเพิ่มเติม (Critic agent ไม่สามารถวิเคราะห์ได้)"
-    else:
-        critique_for_synth = critique
+        critique_for_synth = "ไม่มีข้อเสนอแนะเพิ่มเติม (Critic ไม่สามารถวิเคราะห์ได้)"
 
     # ── Step 3: Synthesizer ──
-    status_container.update(label="🟢 Synthesizing final answer…", state="running")
-    synth_system = (
-        "คุณคือ Synthesizer Agent คุณจะได้รับ Draft และ Critique "
-        "ให้สังเคราะห์คำตอบสุดท้ายที่ดีที่สุด โดยรักษาจุดแข็งของ Draft "
-        "และแก้ไขตามข้อเสนอแนะของ Critic ตอบเป็นภาษาไทย "
-        "ใช้ Markdown เต็มรูปแบบ ห้ามกล่าวถึง Draft หรือ Critique ในคำตอบ "
-        "ตอบเสมือนเป็นคำตอบสุดท้ายที่สมบูรณ์โดยตรง"
-    )
+    status_container.update(label="🟢 Step 3/3 — Synthesizing final answer…", state="running")
     synth_messages = chat_messages + [
         {"role": "assistant", "content": f"**Draft:**\n{draft}\n\n**Critique:**\n{critique_for_synth}"},
         {"role": "user", "content": "สังเคราะห์คำตอบสุดท้ายที่ดีที่สุดจาก Draft และ Critique"},
     ]
-    try:
-        final = call_gemini(api_key, synth_system, synth_messages, temperature=0.5)
-    except Exception as e:
-        final = f"{_error_prefix} — Synthesizer failed: `{e}`\n\n---\n\n**Fallback (Generator Draft):**\n{draft}"
+    final = call_gemini(
+        api_key=api_key,
+        model_name=model_name,
+        system_prompt=(
+            "คุณคือ Synthesizer Agent คุณจะได้รับ Draft และ Critique "
+            "ให้สังเคราะห์คำตอบสุดท้ายที่ดีที่สุด โดยรักษาจุดแข็งของ Draft "
+            "และแก้ไขตามข้อเสนอแนะของ Critic ตอบเป็นภาษาไทย "
+            "ใช้ Markdown เต็มรูปแบบ ห้ามกล่าวถึง Draft หรือ Critique ในคำตอบ "
+            "ตอบเสมือนเป็นคำตอบสุดท้ายที่สมบูรณ์โดยตรง"
+        ),
+        messages=synth_messages,
+        temperature=0.5,
+    )
     thinking["synthesizer"] = final
+
+    # If Synthesizer failed → fall back to Generator draft
+    if final.startswith("⚠️"):
+        final = f"{final}\n\n---\n\n**Fallback (Generator Draft):**\n{draft}"
 
     status_container.update(label="✅ Done thinking", state="complete")
     return final, thinking
 
 
-# ─────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
+# RENDER: Thinking expander (reusable)
+# ═════════════════════════════════════════════
+def render_thinking(thinking: dict):
+    """Render the 3-step thinking process inside the current container."""
+    with st.expander("💭 How Gemini thought about this", expanded=False):
+        st.markdown(
+            '<span class="thinking-label label-generator">🔵 Generator — Initial Draft</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(thinking.get("generator", "—"))
+        st.markdown("---")
+        st.markdown(
+            '<span class="thinking-label label-critic">🟠 Critic — Analysis</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(thinking.get("critic", "—"))
+        st.markdown("---")
+        st.markdown(
+            '<span class="thinking-label label-synthesizer">🟢 Synthesizer — Final</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(thinking.get("synthesizer", "—"))
+
+
+# ═════════════════════════════════════════════
+# SIDEBAR
+# ═════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### 🧠 Self-Debate Chat")
-    st.caption(f"Powered by {st.session_state.model_name}")
+    st.caption(f"Powered by `{st.session_state.model_name}`")
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
-    # Model selector
-    model_options = [
+    # ── Model selector ──
+    MODEL_OPTIONS = [
         "gemini-1.5-flash",
         "gemini-1.5-flash-latest",
         "gemini-1.5-pro-latest",
         "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
     ]
-    current_idx = model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
+    _cur_idx = (
+        MODEL_OPTIONS.index(st.session_state.model_name)
+        if st.session_state.model_name in MODEL_OPTIONS
+        else 0
+    )
     selected_model = st.selectbox(
-        "Model",
-        model_options,
-        index=current_idx,
-        label_visibility="collapsed",
+        "Model", MODEL_OPTIONS, index=_cur_idx, label_visibility="collapsed"
     )
     if selected_model != st.session_state.model_name:
         st.session_state.model_name = selected_model
@@ -465,35 +530,42 @@ with st.sidebar:
 
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
-    # New Chat button
+    # ── New Chat ──
     if st.button("＋  New Chat", use_container_width=True):
         create_new_chat()
         st.rerun()
 
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
-    # API Key fallback input
-    api_key = resolve_api_key()
-    if not api_key:
+    # ── API Key ──
+    current_key = get_api_key()
+
+    if not current_key:
         st.markdown("##### 🔑 API Key")
-        key_input = st.text_input(
+        st.text_input(
             "Gemini API Key",
             type="password",
             placeholder="Paste your Gemini API key",
             label_visibility="collapsed",
+            key="api_key_input",  # writes directly to st.session_state.api_key_input
         )
-        if key_input:
-            st.session_state.api_key = key_input
-            st.rerun()
+        # Show validation hint if something was typed but invalid
+        typed = st.session_state.get("api_key_input", "")
+        if typed and not validate_api_key(typed):
+            st.warning("Key looks too short. Gemini keys are typically 39 characters starting with `AIza…`")
     else:
         st.success("API Key active", icon=":material/check_circle:")
 
+        # Debug toggle — show masked key
+        if st.checkbox("Show masked key", value=False):
+            masked = current_key[:8] + "•" * (len(current_key) - 12) + current_key[-4:]
+            st.code(masked, language=None)
+
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
-    # Recent Chats list
+    # ── Recent Chats ──
     st.markdown("##### Recent Chats")
     if st.session_state.all_chats:
-        # Show newest first
         sorted_ids = sorted(
             st.session_state.all_chats.keys(),
             key=lambda k: st.session_state.all_chats[k]["created_at"],
@@ -502,22 +574,31 @@ with st.sidebar:
         for cid in sorted_ids:
             chat_data = st.session_state.all_chats[cid]
             is_active = cid == st.session_state.active_chat_id
-            label = f"{'●' if is_active else '○'}  {chat_data['title']}"
-            if st.button(label, key=f"chat_{cid}", use_container_width=True):
+            icon = "●" if is_active else "○"
+            if st.button(
+                f"{icon}  {chat_data['title']}", key=f"chat_{cid}", use_container_width=True
+            ):
                 st.session_state.active_chat_id = cid
                 st.rerun()
     else:
         st.caption("No chats yet. Start one!")
 
 
-# ─────────────────────────────────────────────
-# Main Chat Area
-# ─────────────────────────────────────────────
-api_key = resolve_api_key()
+# ═════════════════════════════════════════════
+# MAIN CHAT AREA
+# ═════════════════════════════════════════════
 
-# Welcome screen when no active chat
-if st.session_state.active_chat_id is None or st.session_state.active_chat_id not in st.session_state.all_chats:
-    st.markdown("""
+# Resolve key once for this render cycle
+API_KEY = get_api_key()
+HAS_KEY = API_KEY is not None and validate_api_key(API_KEY)
+
+# Welcome screen
+if (
+    st.session_state.active_chat_id is None
+    or st.session_state.active_chat_id not in st.session_state.all_chats
+):
+    st.markdown(
+        """
     <div class="welcome-container">
         <div class="welcome-badge">🧠 Self-Debate System</div>
         <h1>What can I help you with?</h1>
@@ -526,75 +607,72 @@ if st.session_state.active_chat_id is None or st.session_state.active_chat_id no
             <strong>Generate → Critique → Synthesize</strong> — for higher quality responses.
         </p>
     </div>
-    """, unsafe_allow_html=True)
-
-    if not api_key:
+    """,
+        unsafe_allow_html=True,
+    )
+    if not HAS_KEY:
         st.info("👈 Please enter your Gemini API key in the sidebar to get started.")
 
 # Display existing messages
-messages = get_active_messages()
-for msg in messages:
+for msg in get_active_messages():
     with st.chat_message(msg["role"], avatar="🧑‍💻" if msg["role"] == "user" else "🧠"):
         st.markdown(msg["content"])
-        # Show thinking steps if available
         if msg["role"] == "assistant" and "thinking" in msg:
-            with st.expander("💭 How Gemini thought about this", expanded=False):
-                t = msg["thinking"]
-                st.markdown('<span class="thinking-label label-generator">🔵 Generator — Initial Draft</span>', unsafe_allow_html=True)
-                st.markdown(t.get("generator", ""), unsafe_allow_html=False)
-                st.markdown("---")
-                st.markdown('<span class="thinking-label label-critic">🟠 Critic — Analysis</span>', unsafe_allow_html=True)
-                st.markdown(t.get("critic", ""), unsafe_allow_html=False)
-                st.markdown("---")
-                st.markdown('<span class="thinking-label label-synthesizer">🟢 Synthesizer — Final</span>', unsafe_allow_html=True)
-                st.markdown(t.get("synthesizer", ""), unsafe_allow_html=False)
+            render_thinking(msg["thinking"])
 
-# ─────────────────────────────────────────────
-# Chat Input
-# ─────────────────────────────────────────────
-if prompt := st.chat_input("Message Self-Debate Chat…", disabled=not api_key):
+# ═════════════════════════════════════════════
+# CHAT INPUT
+# ═════════════════════════════════════════════
+if prompt := st.chat_input("Message Self-Debate Chat…", disabled=not HAS_KEY):
+
+    # ── GATE: Re-resolve key at the exact moment of submission ──
+    submit_key = get_api_key()
+    if not submit_key or not validate_api_key(submit_key):
+        st.error(
+            "⚠️ **API Key is missing or invalid.** "
+            "Please enter a valid Gemini API key in the sidebar before sending a message."
+        )
+        st.stop()
+
     # Auto-create chat if none active
-    if st.session_state.active_chat_id is None or st.session_state.active_chat_id not in st.session_state.all_chats:
+    if (
+        st.session_state.active_chat_id is None
+        or st.session_state.active_chat_id not in st.session_state.all_chats
+    ):
         create_new_chat()
 
     cid = st.session_state.active_chat_id
     chat_store = st.session_state.all_chats[cid]
 
-    # Set title from first message
+    # Title from first message
     if not chat_store["messages"]:
         set_chat_title(cid, prompt)
 
-    # Append user message
+    # Save user message
     chat_store["messages"].append({"role": "user", "content": prompt})
 
     # Display user message
     with st.chat_message("user", avatar="🧑‍💻"):
         st.markdown(prompt)
 
-    # Run the self-debate pipeline
+    # ── Run pipeline ──
+    # Snapshot key + model into local vars so they can't change mid-pipeline
+    _key = submit_key
+    _model = st.session_state.model_name
+
     with st.chat_message("assistant", avatar="🧠"):
         with st.status("🧠 Thinking…", expanded=True) as status:
             final_answer, thinking = run_self_debate(
-                api_key,
-                chat_store["messages"],
-                status,
+                api_key=_key,
+                model_name=_model,
+                chat_messages=chat_store["messages"],
+                status_container=status,
             )
 
-        # Display final answer
         st.markdown(final_answer)
+        render_thinking(thinking)
 
-        # Show thinking process
-        with st.expander("💭 How Gemini thought about this", expanded=False):
-            st.markdown('<span class="thinking-label label-generator">🔵 Generator — Initial Draft</span>', unsafe_allow_html=True)
-            st.markdown(thinking.get("generator", ""), unsafe_allow_html=False)
-            st.markdown("---")
-            st.markdown('<span class="thinking-label label-critic">🟠 Critic — Analysis</span>', unsafe_allow_html=True)
-            st.markdown(thinking.get("critic", ""), unsafe_allow_html=False)
-            st.markdown("---")
-            st.markdown('<span class="thinking-label label-synthesizer">🟢 Synthesizer — Final</span>', unsafe_allow_html=True)
-            st.markdown(thinking.get("synthesizer", ""), unsafe_allow_html=False)
-
-    # Save assistant message with thinking
+    # Save assistant message
     chat_store["messages"].append({
         "role": "assistant",
         "content": final_answer,
