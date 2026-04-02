@@ -258,6 +258,8 @@ def init_session():
         st.session_state.active_chat_id = None
     if "api_key" not in st.session_state:
         st.session_state.api_key = None
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = "gemini-1.5-flash"
 
 init_session()
 
@@ -309,18 +311,21 @@ def resolve_api_key():
 # Gemini Helpers
 # ─────────────────────────────────────────────
 def call_gemini(api_key: str, system_prompt: str, messages: list[dict], temperature: float = 0.7) -> str:
-    """Call Gemini 1.5 Pro with retry on 429."""
+    """Call Gemini with retry on 429 and robust error handling."""
     genai.configure(api_key=api_key)
+
+    model_name = st.session_state.get("model_name", "gemini-1.5-flash")
+
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-pro",
+        model_name=model_name,
         system_instruction=system_prompt,
         generation_config=genai.types.GenerationConfig(temperature=temperature),
-        safety_settings={
-            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-        },
+        safety_settings=[
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ],
     )
 
     # Build Gemini-style conversation history
@@ -344,6 +349,12 @@ def call_gemini(api_key: str, system_prompt: str, messages: list[dict], temperat
                     return f"⚠️ Rate limit exceeded. Please wait a moment and try again.\n\n`{e}`"
             elif "safety" in err or "block" in err:
                 return "⚠️ The response was blocked by Gemini's safety filters. Please try rephrasing your message."
+            elif "404" in err or "not found" in err:
+                return (
+                    f"⚠️ Model `{model_name}` not found. "
+                    "Please select a different model in the sidebar.\n\n"
+                    f"`{e}`"
+                )
             else:
                 return f"⚠️ An error occurred: `{e}`"
     return "⚠️ Unexpected error."
@@ -358,6 +369,7 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
     Returns (final_answer, thinking_steps).
     """
     thinking = {}
+    _error_prefix = "⚠️ **Agent Error**"
 
     # ── Step 1: Generator ──
     status_container.update(label="🔵 Generating initial draft…", state="running")
@@ -366,8 +378,18 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
         "โดยอ้างอิงบริบทจากประวัติการสนทนาทั้งหมด ตอบเป็นภาษาไทย ให้ละเอียดและครอบคลุม "
         "ใช้ Markdown ได้เต็มรูปแบบ (ตาราง, โค้ด, หัวข้อ)"
     )
-    draft = call_gemini(api_key, generator_system, chat_messages, temperature=0.7)
+    try:
+        draft = call_gemini(api_key, generator_system, chat_messages, temperature=0.7)
+    except Exception as e:
+        draft = f"{_error_prefix} — Generator failed: `{e}`"
     thinking["generator"] = draft
+
+    # If Generator failed critically, skip remaining steps
+    if draft.startswith("⚠️"):
+        thinking["critic"] = "⏭️ Skipped — Generator did not produce a valid draft."
+        thinking["synthesizer"] = draft
+        status_container.update(label="⚠️ Completed with errors", state="error")
+        return draft, thinking
 
     # ── Step 2: Critic ──
     status_container.update(label="🟠 Analyzing draft for improvements…", state="running")
@@ -380,8 +402,17 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
         {"role": "assistant", "content": draft},
         {"role": "user", "content": "วิเคราะห์คำตอบข้างต้น: จุดอ่อน ข้อผิดพลาด และข้อเสนอแนะ"},
     ]
-    critique = call_gemini(api_key, critic_system, critic_messages, temperature=0.4)
+    try:
+        critique = call_gemini(api_key, critic_system, critic_messages, temperature=0.4)
+    except Exception as e:
+        critique = f"{_error_prefix} — Critic failed: `{e}`"
     thinking["critic"] = critique
+
+    # If Critic failed, Synthesizer works with draft alone
+    if critique.startswith("⚠️"):
+        critique_for_synth = "ไม่มีข้อเสนอแนะเพิ่มเติม (Critic agent ไม่สามารถวิเคราะห์ได้)"
+    else:
+        critique_for_synth = critique
 
     # ── Step 3: Synthesizer ──
     status_container.update(label="🟢 Synthesizing final answer…", state="running")
@@ -393,10 +424,13 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
         "ตอบเสมือนเป็นคำตอบสุดท้ายที่สมบูรณ์โดยตรง"
     )
     synth_messages = chat_messages + [
-        {"role": "assistant", "content": f"**Draft:**\n{draft}\n\n**Critique:**\n{critique}"},
+        {"role": "assistant", "content": f"**Draft:**\n{draft}\n\n**Critique:**\n{critique_for_synth}"},
         {"role": "user", "content": "สังเคราะห์คำตอบสุดท้ายที่ดีที่สุดจาก Draft และ Critique"},
     ]
-    final = call_gemini(api_key, synth_system, synth_messages, temperature=0.5)
+    try:
+        final = call_gemini(api_key, synth_system, synth_messages, temperature=0.5)
+    except Exception as e:
+        final = f"{_error_prefix} — Synthesizer failed: `{e}`\n\n---\n\n**Fallback (Generator Draft):**\n{draft}"
     thinking["synthesizer"] = final
 
     status_container.update(label="✅ Done thinking", state="complete")
@@ -408,7 +442,27 @@ def run_self_debate(api_key: str, chat_messages: list[dict], status_container) -
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🧠 Self-Debate Chat")
-    st.caption("Powered by Gemini 1.5 Pro")
+    st.caption(f"Powered by {st.session_state.model_name}")
+    st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
+
+    # Model selector
+    model_options = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro-latest",
+        "gemini-2.0-flash",
+    ]
+    current_idx = model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
+    selected_model = st.selectbox(
+        "Model",
+        model_options,
+        index=current_idx,
+        label_visibility="collapsed",
+    )
+    if selected_model != st.session_state.model_name:
+        st.session_state.model_name = selected_model
+        st.rerun()
+
     st.markdown('<hr class="subtle-divider">', unsafe_allow_html=True)
 
     # New Chat button
